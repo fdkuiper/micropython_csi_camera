@@ -1,6 +1,6 @@
 /*
  * 仅支持：init() -> capture() -> deinit()
- * 分辨率由关键字参数 w / h 传入（暂未实现），其余在 config.h
+ * Runtime sensor mode selection through init(w=..., h=...).
  */
 #include "py/runtime.h"
 #include "py/mphal.h"
@@ -12,6 +12,9 @@
 #include "esp_ldo_regulator.h"
 #include "driver/isp.h"
 #include "example_sensor_init.h"
+#include "esp_cam_sensor_detect.h"
+#include "esp_sccb_i2c.h"
+#include "py/objtuple.h"
 #include "esp_private/esp_cache_private.h"
 #include "esp_cache.h"
 #include "esp_heap_caps.h"
@@ -19,7 +22,8 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 /* ---------------- 内部状态 ---------------- */
-#define NUM_CAM_BUFFERS   2
+#undef NUM_CAM_BUFFERS
+#define NUM_CAM_BUFFERS   1
 
 static void *cam_buffers[NUM_CAM_BUFFERS] = {NULL};
 static size_t cam_buffer_size = 0;
@@ -28,6 +32,83 @@ static esp_cam_ctlr_handle_t cam_handle = NULL;
 static isp_proc_handle_t     isp_proc   = NULL;
 static esp_ldo_channel_handle_t ldo_mipi_phy = NULL;
 static example_sensor_handle_t sensor_handle = {0};
+static esp_cam_sensor_device_t *sensor_device;
+static const esp_cam_sensor_format_t *active_format;
+static bool csi_enabled, csi_started, isp_enabled;
+static uint16_t frame_width, frame_height;
+
+static mp_obj_t camera_deinit(void);
+
+// Every caller holds the application camera lock, including init/deinit/formats.
+static void camera_check(esp_err_t result)
+{
+    if (result != ESP_OK) {
+        mp_raise_msg_varg(&mp_type_RuntimeError,
+            MP_ERROR_TEXT("Camera driver error: %s"), esp_err_to_name(result));
+    }
+}
+
+static void camera_sensor_open(void)
+{
+    i2c_master_bus_config_t bus = {
+        .clk_source = I2C_CLK_SRC_DEFAULT,
+        .sda_io_num = CSI_MIPI_CSI_CAM_SCCB_SDA_IO,
+        .scl_io_num = CSI_MIPI_CSI_CAM_SCCB_SCL_IO,
+        .i2c_port = I2C_NUM_0,
+        .flags.enable_internal_pullup = true,
+    };
+    camera_check(i2c_new_master_bus(&bus, &sensor_handle.i2c_bus_handle));
+    for (esp_cam_sensor_detect_fn_t *p = &__esp_cam_sensor_detect_fn_array_start;
+         p < &__esp_cam_sensor_detect_fn_array_end; ++p) {
+        if (p->port != ESP_CAM_SENSOR_MIPI_CSI) {
+            continue;
+        }
+        sccb_i2c_config_t io = {
+            .scl_speed_hz = 100000,
+            .device_address = p->sccb_addr,
+            .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        };
+        camera_check(sccb_new_i2c_io(sensor_handle.i2c_bus_handle, &io,
+                                   &sensor_handle.sccb_handle));
+        esp_cam_sensor_config_t cfg = {
+            .sccb_handle = sensor_handle.sccb_handle,
+            .reset_pin = -1, .pwdn_pin = -1, .xclk_pin = -1,
+            .sensor_port = ESP_CAM_SENSOR_MIPI_CSI,
+        };
+        sensor_device = p->detect(&cfg);
+        if (sensor_device) {
+            return;
+        }
+        camera_check(esp_sccb_del_i2c_io(sensor_handle.sccb_handle));
+        sensor_handle.sccb_handle = NULL;
+    }
+    mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("Camera sensor not detected"));
+}
+
+static bool camera_supported_format(const esp_cam_sensor_format_t *fmt)
+{
+    return fmt->port == ESP_CAM_SENSOR_MIPI_CSI &&
+        (fmt->format == ESP_CAM_SENSOR_PIXFORMAT_RAW8 ||
+         fmt->format == ESP_CAM_SENSOR_PIXFORMAT_RAW10) &&
+        fmt->isp_info && fmt->isp_info->isp_v1_info.version == 1 &&
+        fmt->isp_info->isp_v1_info.bayer_type == ESP_CAM_SENSOR_BAYER_GBRG;
+}
+// Match full-width Python integers before narrowing to peripheral dimensions.
+static const esp_cam_sensor_format_t *camera_find_format(
+    const esp_cam_sensor_format_array_t *formats, mp_int_t w, mp_int_t h)
+{
+    if (w <= 0 || h <= 0 || w > UINT16_MAX || h > UINT16_MAX) {
+        return NULL;
+    }
+    for (int i = 0; i < formats->count; ++i) {
+        const esp_cam_sensor_format_t *fmt = &formats->format_array[i];
+        if (fmt->width == w && fmt->height == h && camera_supported_format(fmt)) {
+            return fmt;
+        }
+    }
+    return NULL;
+}
+
 jpeg_encoder_handle_t jpeg_handle;
 jpeg_encode_memory_alloc_cfg_t tx_mem_cfg, rx_mem_cfg;
 static SemaphoreHandle_t frame_done = NULL;
@@ -47,7 +128,7 @@ static bool camera_trans_finished(esp_cam_ctlr_handle_t handle,
 }
 
 /* -------------- init -------------- */
-static mp_obj_t camera_init(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args)
+static mp_obj_t camera_init_inner(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args)
 {
     enum { ARG_w, ARG_h };
     static const mp_arg_t allowed_args[] = {
@@ -58,22 +139,17 @@ static mp_obj_t camera_init(size_t n_args, const mp_obj_t *pos_args, mp_map_t *k
     mp_arg_parse_all(n_args, pos_args, kw_args,
                      MP_ARRAY_SIZE(allowed_args), allowed_args, args);
 
-    const uint16_t w = args[ARG_w].u_int;
-    const uint16_t h = args[ARG_h].u_int;
+    const mp_int_t w = args[ARG_w].u_int;
+    const mp_int_t h = args[ARG_h].u_int;
 
-    // The sensor format and JPEG dimensions are fixed by config.h.
-    if (w != CSI_MIPI_CSI_DISP_HRES || h != CSI_MIPI_CSI_DISP_VRES) {
+    if (w <= 0 || h <= 0 || w > UINT16_MAX || h > UINT16_MAX) {
         mp_raise_ValueError(MP_ERROR_TEXT("Unsupported camera dimensions"));
-    }
-    if (cam_handle != NULL) {
-        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("Camera already initialized"));
     }
     frame_done = xSemaphoreCreateBinary();
     if (frame_done == NULL) {
         mp_raise_msg(&mp_type_MemoryError, MP_ERROR_TEXT("Frame semaphore alloc failed"));
     }
 
-    cam_buffer_size = w * h * 2;          // RGB565
 
     /* 1. LDO */
     esp_ldo_channel_config_t ldo_cfg = {
@@ -84,6 +160,17 @@ static mp_obj_t camera_init(size_t n_args, const mp_obj_t *pos_args, mp_map_t *k
         mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("LDO acquire failed"));
     }
     mp_printf(&mp_plat_print, "LDO initialized\n");
+    camera_sensor_open();
+    esp_cam_sensor_format_array_t formats = {0};
+    camera_check(esp_cam_sensor_query_format(sensor_device, &formats));
+    active_format = camera_find_format(&formats, w, h);
+    if (!active_format) {
+        mp_raise_ValueError(MP_ERROR_TEXT("Unsupported camera dimensions"));
+    }
+    camera_check(esp_cam_sensor_set_format(sensor_device, active_format));
+    frame_width = w;
+    frame_height = h;
+    cam_buffer_size = (size_t)w * h * 2; // ISP output is RGB565 for every sensor mode.
     /* 2. 帧缓冲 */
     size_t align = 0;
     // Cache invalidation must use the external-memory cache-line alignment.
@@ -99,26 +186,16 @@ static mp_obj_t camera_init(size_t n_args, const mp_obj_t *pos_args, mp_map_t *k
     	mp_printf(&mp_plat_print, "Camera buffer %d allocated: %p\n", i, cam_buffers[i]);
     }
     mp_printf(&mp_plat_print, "%d camera buffers allocated\n", NUM_CAM_BUFFERS);
-    /* 3. 传感器 */
-    example_sensor_config_t sensor_cfg = {
-        .i2c_port_num   = I2C_NUM_0,
-        .i2c_sda_io_num = CSI_MIPI_CSI_CAM_SCCB_SDA_IO,
-        .i2c_scl_io_num = CSI_MIPI_CSI_CAM_SCCB_SCL_IO,
-        .port           = ESP_CAM_SENSOR_MIPI_CSI,
-        .format_name    = CSI_CAM_FORMAT,
-    };
-    example_sensor_init(&sensor_cfg, &sensor_handle);
-    mp_printf(&mp_plat_print, "Camera sensor initialized\n");
-
     /* 4. CSI 控制器 */
     esp_cam_ctlr_csi_config_t csi_cfg = {
         .ctlr_id                = 0,
         .h_res                  = w,
         .v_res                  = h,
-        .lane_bit_rate_mbps     = CSI_MIPI_CSI_LANE_BITRATE_MBPS,
-        .input_data_color_type  = CAM_CTLR_COLOR_RAW8,
+        .lane_bit_rate_mbps     = active_format->mipi_info.mipi_clk / 1000000,
+        .input_data_color_type  = active_format->format == ESP_CAM_SENSOR_PIXFORMAT_RAW10
+                                  ? CAM_CTLR_COLOR_RAW10 : CAM_CTLR_COLOR_RAW8,
         .output_data_color_type = CAM_CTLR_COLOR_RGB565,
-        .data_lane_num          = 2,
+        .data_lane_num          = active_format->mipi_info.lane_num,
         .byte_swap_en           = false,
         .queue_items            = 1,
     };
@@ -134,34 +211,37 @@ static mp_obj_t camera_init(size_t n_args, const mp_obj_t *pos_args, mp_map_t *k
         .on_get_new_trans  = NULL,
         .on_trans_finished = camera_trans_finished,
     };
-    if (esp_cam_ctlr_register_event_callbacks(cam_handle, &cbs, NULL) != ESP_OK ||
-        esp_cam_ctlr_enable(cam_handle) != ESP_OK) {
-        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("CSI enable failed"));
-    }
+    camera_check(esp_cam_ctlr_register_event_callbacks(cam_handle, &cbs, NULL));
+    camera_check(esp_cam_ctlr_enable(cam_handle));
+    csi_enabled = true;
     mp_printf(&mp_plat_print, "Camera event callbacks registered\n");
     /* 5. ISP */
     esp_isp_processor_cfg_t isp_cfg = {
         .clk_hz                 = 80 * 1000 * 1000,
         .input_data_source      = ISP_INPUT_DATA_SOURCE_CSI,
-        .input_data_color_type  = ISP_COLOR_RAW8,
+        .input_data_color_type  = active_format->format == ESP_CAM_SENSOR_PIXFORMAT_RAW10
+                                  ? ISP_COLOR_RAW10 : ISP_COLOR_RAW8,
+        .bayer_order            = COLOR_RAW_ELEMENT_ORDER_GBRG,
         .output_data_color_type = ISP_COLOR_RGB565,
-        .has_line_start_packet  = true,
-        .has_line_end_packet    = true,
+        .has_line_start_packet  = active_format->mipi_info.line_sync_en,
+        .has_line_end_packet    = active_format->mipi_info.line_sync_en,
         .h_res                  = w,
         .v_res                  = h,
     };
-    if (esp_isp_new_processor(&isp_cfg, &isp_proc) != ESP_OK ||
-        esp_isp_enable(isp_proc) != ESP_OK) {
-        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("ISP init failed"));
-    }
+    camera_check(esp_isp_new_processor(&isp_cfg, &isp_proc));
+    camera_check(esp_isp_enable(isp_proc));
+    isp_enabled = true;
     mp_printf(&mp_plat_print, "ISP processor initialized\n");
     /* 6. 启动 */
     if (esp_cam_ctlr_start(cam_handle) != ESP_OK) {
         mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("Camera start failed"));
     }
+    csi_started = true;
+    int stream_on = 1;
+    camera_check(esp_cam_sensor_ioctl(sensor_device, ESP_CAM_SENSOR_IOC_S_STREAM, &stream_on));
     mp_printf(&mp_plat_print, "Camera capture started\n");
     jpeg_encode_engine_cfg_t encode_eng_cfg = {
-        .timeout_ms = 70,
+        .timeout_ms = 1000,
     };
 
     rx_mem_cfg.buffer_direction = JPEG_ENC_ALLOC_OUTPUT_BUFFER;
@@ -174,19 +254,64 @@ static mp_obj_t camera_init(size_t n_args, const mp_obj_t *pos_args, mp_map_t *k
     mp_printf(&mp_plat_print, "Jpeg encoder initialized\n");
     return mp_const_none;
 }
+// Keep the exception guard outside argument parsing so all partial resources
+// are released, without tearing down an already-running camera on misuse.
+static mp_obj_t camera_init(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args)
+{
+    if (cam_handle || sensor_device) {
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("Camera already initialized"));
+    }
+    nlr_buf_t nlr;
+    if (nlr_push(&nlr) == 0) {
+        mp_obj_t result = camera_init_inner(n_args, pos_args, kw_args);
+        nlr_pop();
+        return result;
+    }
+    camera_deinit();
+    nlr_jump(nlr.ret_val);
+}
 MP_DEFINE_CONST_FUN_OBJ_KW(camera_init_obj, 0, camera_init);
+
+static mp_obj_t camera_formats(void)
+{
+    if (!sensor_device) {
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("Initialize camera before querying formats"));
+    }
+    esp_cam_sensor_format_array_t formats = {0};
+    camera_check(esp_cam_sensor_query_format(sensor_device, &formats));
+    mp_obj_t result = mp_obj_new_list(0, NULL);
+    for (int i = 0; i < formats.count; ++i) {
+        const esp_cam_sensor_format_t *fmt = &formats.format_array[i];
+        if (!camera_supported_format(fmt)) {
+            continue;
+        }
+        mp_obj_t entry[] = {
+            mp_obj_new_int(fmt->width), mp_obj_new_int(fmt->height),
+            mp_obj_new_int(fmt->fps),
+            mp_obj_new_str(fmt->format == ESP_CAM_SENSOR_PIXFORMAT_RAW10 ? "RAW10" : "RAW8",
+                           fmt->format == ESP_CAM_SENSOR_PIXFORMAT_RAW10 ? 5 : 4),
+        };
+        mp_obj_list_append(result, mp_obj_new_tuple(MP_ARRAY_SIZE(entry), entry));
+    }
+    return result;
+}
+MP_DEFINE_CONST_FUN_OBJ_0(camera_formats_obj, camera_formats);
 
 /* -------------- deinit -------------- */
 static mp_obj_t camera_deinit(void)
 {
+    if (sensor_device) {
+        int stream_off = 0;
+        esp_cam_sensor_ioctl(sensor_device, ESP_CAM_SENSOR_IOC_S_STREAM, &stream_off);
+    }
     if (cam_handle) {
-        esp_cam_ctlr_stop(cam_handle);
-        esp_cam_ctlr_disable(cam_handle);
+        if (csi_started) esp_cam_ctlr_stop(cam_handle);
+        if (csi_enabled) esp_cam_ctlr_disable(cam_handle);
         esp_cam_ctlr_del(cam_handle);
         cam_handle = NULL;
     }
     if (isp_proc) {
-        esp_isp_disable(isp_proc);
+        if (isp_enabled) esp_isp_disable(isp_proc);
         esp_isp_del_processor(isp_proc);
         isp_proc = NULL;
     }
@@ -198,10 +323,21 @@ static mp_obj_t camera_deinit(void)
         vSemaphoreDelete(frame_done);
         frame_done = NULL;
     }
-    if (sensor_handle.i2c_bus_handle && sensor_handle.sccb_handle) {
-        example_sensor_deinit(sensor_handle);
-        sensor_handle = (example_sensor_handle_t){0};
+    if (sensor_device) {
+        esp_cam_sensor_del_dev(sensor_device);
+        sensor_device = NULL;
     }
+    if (sensor_handle.sccb_handle) {
+        esp_sccb_del_i2c_io(sensor_handle.sccb_handle);
+        sensor_handle.sccb_handle = NULL;
+    }
+    if (sensor_handle.i2c_bus_handle) {
+        i2c_del_master_bus(sensor_handle.i2c_bus_handle);
+        sensor_handle.i2c_bus_handle = NULL;
+    }
+    active_format = NULL;
+    csi_enabled = csi_started = isp_enabled = false;
+    frame_width = frame_height = 0;
     if (ldo_mipi_phy) {
         esp_ldo_release_channel(ldo_mipi_phy);
         ldo_mipi_phy = NULL;
@@ -276,8 +412,8 @@ static mp_obj_t camera_capture(void)
         .src_type = JPEG_ENCODE_IN_FORMAT_RGB565,
         .sub_sample = JPEG_DOWN_SAMPLING_YUV422,
         .image_quality = 80,
-        .width = CSI_MIPI_CSI_DISP_HRES,
-        .height = CSI_MIPI_CSI_DISP_VRES,
+        .width = frame_width,
+        .height = frame_height,
     };
 
     if (jpeg_encoder_process(jpeg_handle, &enc_config, raw_buf_1080p, raw_size_1080p, jpg_buf_1080p, rx_buffer_size, &jpg_size_1080p) != ESP_OK){
@@ -302,6 +438,7 @@ static const mp_rom_map_elem_t camera_globals_table[] = {
     { MP_ROM_QSTR(MP_QSTR___name__), MP_ROM_QSTR(MP_QSTR_camera) },
     { MP_ROM_QSTR(MP_QSTR_init),    MP_ROM_PTR(&camera_init_obj) },
     { MP_ROM_QSTR(MP_QSTR_deinit),  MP_ROM_PTR(&camera_deinit_obj) },
+    { MP_ROM_QSTR(MP_QSTR_formats), MP_ROM_PTR(&camera_formats_obj) },
     { MP_ROM_QSTR(MP_QSTR_capture), MP_ROM_PTR(&camera_capture_obj) },
 };
 static MP_DEFINE_CONST_DICT(camera_globals, camera_globals_table);
