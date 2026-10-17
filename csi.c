@@ -13,8 +13,11 @@
 #include "driver/isp.h"
 #include "example_sensor_init.h"
 #include "esp_private/esp_cache_private.h"
+#include "esp_cache.h"
 #include "esp_heap_caps.h"
 #include "driver/jpeg_encode.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 /* ---------------- 内部状态 ---------------- */
 #define NUM_CAM_BUFFERS   2
 
@@ -24,27 +27,23 @@ static size_t cam_buffer_size = 0;
 static esp_cam_ctlr_handle_t cam_handle = NULL;
 static isp_proc_handle_t     isp_proc   = NULL;
 static esp_ldo_channel_handle_t ldo_mipi_phy = NULL;
+static example_sensor_handle_t sensor_handle = {0};
 jpeg_encoder_handle_t jpeg_handle;
 jpeg_encode_memory_alloc_cfg_t tx_mem_cfg, rx_mem_cfg;
-static bool frame_ready = false;
+static SemaphoreHandle_t frame_done = NULL;
 uint32_t raw_size_1080p;
 uint32_t jpg_size_1080p;
 /* ---------------- 回调 ---------------- */
-static bool camera_get_new_buffer(esp_cam_ctlr_handle_t handle,
-                                  esp_cam_ctlr_trans_t *trans,
-                                  void *user_data)
-{
-    trans->buffer = cam_buffers[0];          // 只用第一块 buffer
-    trans->buflen = cam_buffer_size;
-    return false;
-}
-
 static bool camera_trans_finished(esp_cam_ctlr_handle_t handle,
                                   esp_cam_ctlr_trans_t *trans,
                                   void *user_data)
 {
-    frame_ready = true;
-    return false;
+    BaseType_t task_woken = pdFALSE;
+    if (trans->buffer == cam_buffers[0] &&
+        trans->received_size == cam_buffer_size) {
+        xSemaphoreGiveFromISR(frame_done, &task_woken);
+    }
+    return task_woken == pdTRUE;
 }
 
 /* -------------- init -------------- */
@@ -62,6 +61,18 @@ static mp_obj_t camera_init(size_t n_args, const mp_obj_t *pos_args, mp_map_t *k
     const uint16_t w = args[ARG_w].u_int;
     const uint16_t h = args[ARG_h].u_int;
 
+    // The sensor format and JPEG dimensions are fixed by config.h.
+    if (w != CSI_MIPI_CSI_DISP_HRES || h != CSI_MIPI_CSI_DISP_VRES) {
+        mp_raise_ValueError(MP_ERROR_TEXT("Unsupported camera dimensions"));
+    }
+    if (cam_handle != NULL) {
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("Camera already initialized"));
+    }
+    frame_done = xSemaphoreCreateBinary();
+    if (frame_done == NULL) {
+        mp_raise_msg(&mp_type_MemoryError, MP_ERROR_TEXT("Frame semaphore alloc failed"));
+    }
+
     cam_buffer_size = w * h * 2;          // RGB565
 
     /* 1. LDO */
@@ -75,7 +86,10 @@ static mp_obj_t camera_init(size_t n_args, const mp_obj_t *pos_args, mp_map_t *k
     mp_printf(&mp_plat_print, "LDO initialized\n");
     /* 2. 帧缓冲 */
     size_t align = 0;
-    esp_cache_get_alignment(0, &align);
+    // Cache invalidation must use the external-memory cache-line alignment.
+    if (esp_cache_get_alignment(MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA, &align) != ESP_OK || !align) {
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("Camera cache alignment unavailable"));
+    }
     for (int i = 0; i < NUM_CAM_BUFFERS; ++i) {
         cam_buffers[i] = heap_caps_aligned_calloc(align, 1, cam_buffer_size,
                                                   MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA);
@@ -86,7 +100,6 @@ static mp_obj_t camera_init(size_t n_args, const mp_obj_t *pos_args, mp_map_t *k
     }
     mp_printf(&mp_plat_print, "%d camera buffers allocated\n", NUM_CAM_BUFFERS);
     /* 3. 传感器 */
-    i2c_master_bus_handle_t sensor_handle;
     example_sensor_config_t sensor_cfg = {
         .i2c_port_num   = I2C_NUM_0,
         .i2c_sda_io_num = CSI_MIPI_CSI_CAM_SCCB_SDA_IO,
@@ -116,7 +129,9 @@ static mp_obj_t camera_init(size_t n_args, const mp_obj_t *pos_args, mp_map_t *k
    
 
     esp_cam_ctlr_evt_cbs_t cbs = {
-        .on_get_new_trans  = camera_get_new_buffer,
+        // With no queued user buffer, CSI writes into its internal backup.
+        // A user buffer is submitted only by capture(), exactly once.
+        .on_get_new_trans  = NULL,
         .on_trans_finished = camera_trans_finished,
     };
     if (esp_cam_ctlr_register_event_callbacks(cam_handle, &cbs, NULL) != ESP_OK ||
@@ -149,9 +164,9 @@ static mp_obj_t camera_init(size_t n_args, const mp_obj_t *pos_args, mp_map_t *k
         .timeout_ms = 70,
     };
 
-    rx_mem_cfg.buffer_direction = JPEG_DEC_ALLOC_OUTPUT_BUFFER;
+    rx_mem_cfg.buffer_direction = JPEG_ENC_ALLOC_OUTPUT_BUFFER;
 
-    tx_mem_cfg.buffer_direction = JPEG_DEC_ALLOC_INPUT_BUFFER;
+    tx_mem_cfg.buffer_direction = JPEG_ENC_ALLOC_INPUT_BUFFER;
 
     if (jpeg_new_encoder_engine(&encode_eng_cfg, &jpeg_handle) != ESP_OK){
     	mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("Jpeg encoder init failed"));
@@ -175,6 +190,18 @@ static mp_obj_t camera_deinit(void)
         esp_isp_del_processor(isp_proc);
         isp_proc = NULL;
     }
+    if (jpeg_handle) {
+        jpeg_del_encoder_engine(jpeg_handle);
+        jpeg_handle = NULL;
+    }
+    if (frame_done) {
+        vSemaphoreDelete(frame_done);
+        frame_done = NULL;
+    }
+    if (sensor_handle.i2c_bus_handle && sensor_handle.sccb_handle) {
+        example_sensor_deinit(sensor_handle);
+        sensor_handle = (example_sensor_handle_t){0};
+    }
     if (ldo_mipi_phy) {
         esp_ldo_release_channel(ldo_mipi_phy);
         ldo_mipi_phy = NULL;
@@ -189,10 +216,37 @@ static mp_obj_t camera_deinit(void)
 }
 MP_DEFINE_CONST_FUN_OBJ_0(camera_deinit_obj, camera_deinit);
 
+// Called after Python threads stop, before MicroPython tears down its VM.
+void camera_deinit_all(void)
+{
+    camera_deinit();
+}
+
 static mp_obj_t camera_capture(void)
 {
-    if (!cam_buffers[0]) {
+    if (!cam_buffers[0] || !frame_done) {
         mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("Camera not initialized"));
+    }
+
+    // Discard any stale completion, then queue one complete frame.
+    // ESP-IDF switches DMA back to its internal backup before notifying us.
+    xSemaphoreTake(frame_done, 0);
+    esp_cam_ctlr_trans_t transaction = {
+        .buffer = cam_buffers[0],
+        .buflen = cam_buffer_size,
+    };
+    if (esp_cam_ctlr_receive(cam_handle, &transaction, 1000) != ESP_OK ||
+        xSemaphoreTake(frame_done, pdMS_TO_TICKS(1000)) != pdTRUE) {
+        // Stop DMA before freeing a buffer that could still be queued/in use.
+        camera_deinit();
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("Camera frame timeout; restart board"));
+    }
+    // CSI DMA writes PSRAM without updating the CPU cache. In the vendor's
+    // ESP-IDF revision the completion callback can invalidate zero bytes.
+    // The buffer is now owned by capture(), so invalidate the full image.
+    if (esp_cache_msync(cam_buffers[0], cam_buffer_size,
+                        ESP_CACHE_MSYNC_FLAG_DIR_M2C) != ESP_OK) {
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("Camera cache invalidate failed"));
     }
 
     // 获取原始图像数据大小
@@ -210,8 +264,9 @@ static mp_obj_t camera_capture(void)
 
     // 分配内存用于存储 JPEG 数据
     size_t rx_buffer_size = 0;
-    uint8_t *jpg_buf_1080p = (uint8_t*)jpeg_alloc_encoder_mem(raw_size_1080p / 10, &rx_mem_cfg, &rx_buffer_size);
+    uint8_t *jpg_buf_1080p = (uint8_t*)jpeg_alloc_encoder_mem(raw_size_1080p, &rx_mem_cfg, &rx_buffer_size);
     if (jpg_buf_1080p == NULL) {
+        free(raw_buf_1080p);
         mp_raise_msg(&mp_type_MemoryError, MP_ERROR_TEXT("Failed to allocate memory for JPEG buffer"));
         
     }
@@ -226,6 +281,8 @@ static mp_obj_t camera_capture(void)
     };
 
     if (jpeg_encoder_process(jpeg_handle, &enc_config, raw_buf_1080p, raw_size_1080p, jpg_buf_1080p, rx_buffer_size, &jpg_size_1080p) != ESP_OK){
+        free(raw_buf_1080p);
+        free(jpg_buf_1080p);
         mp_raise_msg(&mp_type_MemoryError, MP_ERROR_TEXT("Failed"));
     }
 
