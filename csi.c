@@ -19,6 +19,8 @@
 #include "esp_cache.h"
 #include "esp_heap_caps.h"
 #include "driver/jpeg_encode.h"
+#include "esp_h264_enc_single_hw.h"
+#include "esp_h264_alloc.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 /* ---------------- 内部状态 ---------------- */
@@ -36,6 +38,16 @@ static esp_cam_sensor_device_t *sensor_device;
 static const esp_cam_sensor_format_t *active_format;
 static bool csi_enabled, csi_started, isp_enabled;
 static uint16_t frame_width, frame_height;
+static bool h264_mode;
+static esp_h264_enc_handle_t h264_handle;
+static uint8_t *h264_output;
+static uint32_t h264_output_size;
+
+static void h264_check(esp_h264_err_t err) {
+    if (err != ESP_H264_ERR_OK) {
+        mp_raise_msg_varg(&mp_type_RuntimeError, MP_ERROR_TEXT("H264 encoder error: %d"), err);
+    }
+}
 
 static mp_obj_t camera_deinit(void);
 
@@ -130,11 +142,16 @@ static bool camera_trans_finished(esp_cam_ctlr_handle_t handle,
 /* -------------- init -------------- */
 static mp_obj_t camera_init_inner(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args)
 {
-    enum { ARG_w, ARG_h };
+    enum { ARG_w, ARG_h, ARG_h264, ARG_fps, ARG_gop, ARG_bitrate };
     static const mp_arg_t allowed_args[] = {
         { MP_QSTR_w, MP_ARG_INT, {.u_int = CSI_MIPI_CSI_DISP_HRES} },
         { MP_QSTR_h, MP_ARG_INT, {.u_int = CSI_MIPI_CSI_DISP_VRES} },
+        { MP_QSTR_h264, MP_ARG_BOOL, {.u_bool = false} },
+        { MP_QSTR_fps, MP_ARG_INT, {.u_int = 20} },
+        { MP_QSTR_gop, MP_ARG_INT, {.u_int = 10} },
+        { MP_QSTR_bitrate, MP_ARG_INT, {.u_int = 2000000} },
     };
+        /* H264 settings are target rates; the application paces capture. */
     mp_arg_val_t args[MP_ARRAY_SIZE(allowed_args)];
     mp_arg_parse_all(n_args, pos_args, kw_args,
                      MP_ARRAY_SIZE(allowed_args), allowed_args, args);
@@ -144,6 +161,13 @@ static mp_obj_t camera_init_inner(size_t n_args, const mp_obj_t *pos_args, mp_ma
 
     if (w <= 0 || h <= 0 || w > UINT16_MAX || h > UINT16_MAX) {
         mp_raise_ValueError(MP_ERROR_TEXT("Unsupported camera dimensions"));
+    }
+    h264_mode = args[ARG_h264].u_bool;
+    if (h264_mode && ((w % 16) || (h % 16) || w > 1920 || h > 2032 ||
+        args[ARG_fps].u_int < 1 || args[ARG_fps].u_int > 255 ||
+        args[ARG_gop].u_int < 1 || args[ARG_gop].u_int > 255 ||
+        args[ARG_bitrate].u_int < 10000 || args[ARG_bitrate].u_int > 20000000)) {
+        mp_raise_ValueError(MP_ERROR_TEXT("Invalid H264 dimensions, fps, gop or bitrate"));
     }
     frame_done = xSemaphoreCreateBinary();
     if (frame_done == NULL) {
@@ -168,9 +192,12 @@ static mp_obj_t camera_init_inner(size_t n_args, const mp_obj_t *pos_args, mp_ma
         mp_raise_ValueError(MP_ERROR_TEXT("Unsupported camera dimensions"));
     }
     camera_check(esp_cam_sensor_set_format(sensor_device, active_format));
+    if (h264_mode && args[ARG_fps].u_int > active_format->fps) {
+        mp_raise_ValueError(MP_ERROR_TEXT("H264 fps exceeds sensor rate"));
+    }
     frame_width = w;
     frame_height = h;
-    cam_buffer_size = (size_t)w * h * 2; // ISP output is RGB565 for every sensor mode.
+    cam_buffer_size = h264_mode ? (size_t)w * h * 3 / 2 : (size_t)w * h * 2;
     /* 2. 帧缓冲 */
     size_t align = 0;
     // Cache invalidation must use the external-memory cache-line alignment.
@@ -194,7 +221,7 @@ static mp_obj_t camera_init_inner(size_t n_args, const mp_obj_t *pos_args, mp_ma
         .lane_bit_rate_mbps     = active_format->mipi_info.mipi_clk / 1000000,
         .input_data_color_type  = active_format->format == ESP_CAM_SENSOR_PIXFORMAT_RAW10
                                   ? CAM_CTLR_COLOR_RAW10 : CAM_CTLR_COLOR_RAW8,
-        .output_data_color_type = CAM_CTLR_COLOR_RGB565,
+        .output_data_color_type = h264_mode ? CAM_CTLR_COLOR_YUV420 : CAM_CTLR_COLOR_RGB565,
         .data_lane_num          = active_format->mipi_info.lane_num,
         .byte_swap_en           = false,
         .queue_items            = 1,
@@ -222,7 +249,7 @@ static mp_obj_t camera_init_inner(size_t n_args, const mp_obj_t *pos_args, mp_ma
         .input_data_color_type  = active_format->format == ESP_CAM_SENSOR_PIXFORMAT_RAW10
                                   ? ISP_COLOR_RAW10 : ISP_COLOR_RAW8,
         .bayer_order            = COLOR_RAW_ELEMENT_ORDER_GBRG,
-        .output_data_color_type = ISP_COLOR_RGB565,
+        .output_data_color_type = h264_mode ? ISP_COLOR_YUV420 : ISP_COLOR_RGB565,
         .has_line_start_packet  = active_format->mipi_info.line_sync_en,
         .has_line_end_packet    = active_format->mipi_info.line_sync_en,
         .h_res                  = w,
@@ -240,6 +267,22 @@ static mp_obj_t camera_init_inner(size_t n_args, const mp_obj_t *pos_args, mp_ma
     int stream_on = 1;
     camera_check(esp_cam_sensor_ioctl(sensor_device, ESP_CAM_SENSOR_IOC_S_STREAM, &stream_on));
     mp_printf(&mp_plat_print, "Camera capture started\n");
+    if (h264_mode) {
+        esp_h264_enc_cfg_hw_t cfg = {
+            .pic_type = ESP_H264_RAW_FMT_O_UYY_E_VYY,
+            .gop = args[ARG_gop].u_int, .fps = args[ARG_fps].u_int,
+            .res = {.width = w, .height = h},
+            .rc = {.bitrate = args[ARG_bitrate].u_int, .qp_min = 20, .qp_max = 40},
+        };
+        h264_check(esp_h264_enc_hw_new(&cfg, &h264_handle));
+        h264_check(esp_h264_enc_open(h264_handle));
+        h264_output = esp_h264_aligned_calloc(64, 1, cam_buffer_size,
+                                            &h264_output_size, ESP_H264_MEM_SPIRAM);
+        if (!h264_output) {
+            mp_raise_msg(&mp_type_MemoryError, MP_ERROR_TEXT("H264 output allocation failed"));
+        }
+        return mp_const_none;
+    }
     jpeg_encode_engine_cfg_t encode_eng_cfg = {
         .timeout_ms = 1000,
     };
@@ -315,6 +358,17 @@ static mp_obj_t camera_deinit(void)
         esp_isp_del_processor(isp_proc);
         isp_proc = NULL;
     }
+    if (h264_handle) {
+        esp_h264_enc_close(h264_handle);
+        esp_h264_enc_del(h264_handle);
+        h264_handle = NULL;
+    }
+    if (h264_output) {
+        esp_h264_free(h264_output);
+        h264_output = NULL;
+    }
+    h264_output_size = 0;
+    h264_mode = false;
     if (jpeg_handle) {
         jpeg_del_encoder_engine(jpeg_handle);
         jpeg_handle = NULL;
@@ -385,6 +439,25 @@ static mp_obj_t camera_capture(void)
         mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("Camera cache invalidate failed"));
     }
 
+    if (h264_mode) {
+        esp_h264_enc_in_frame_t input = {
+            .raw_data = {.buffer = cam_buffers[0], .len = cam_buffer_size},
+        };
+        esp_h264_enc_out_frame_t output = {
+            .raw_data = {.buffer = h264_output, .len = h264_output_size},
+        };
+        esp_h264_err_t err = esp_h264_enc_process(h264_handle, &input, &output);
+        if (err != ESP_H264_ERR_OK) {
+            // Fail closed: never continue sending a broken prediction chain.
+            camera_deinit();
+            h264_check(err);
+        }
+        mp_obj_t result[] = {
+            mp_obj_new_bytes(h264_output, output.length),
+            mp_obj_new_bool(output.frame_type == ESP_H264_FRAME_TYPE_IDR),
+        };
+        return mp_obj_new_tuple(2, result);
+    }
     // 获取原始图像数据大小
     raw_size_1080p = cam_buffer_size;
 
