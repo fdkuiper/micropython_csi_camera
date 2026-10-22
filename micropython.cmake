@@ -68,3 +68,13 @@ target_include_directories(usermod_camera INTERFACE ${CAM_INCLUDES})
 #  Link usermod interface
 # -----------------------------------------------------------------------------
 target_link_libraries(usermod INTERFACE usermod_camera)
+
+# The board fork opts into the OV9281 backport; no managed components are edited.
+if(MICROPY_CAMERA_OV9281)
+    target_sources(usermod_camera INTERFACE
+        ${CMAKE_CURRENT_LIST_DIR}/sensors/ov9281/ov9281.c)
+    target_include_directories(usermod_camera INTERFACE
+        ${CMAKE_CURRENT_LIST_DIR}/sensors/ov9281/include
+        ${CMAKE_CURRENT_LIST_DIR}/sensors/ov9281/private_include)
+    target_compile_definitions(usermod_camera INTERFACE MICROPY_CAMERA_OV9281=1)
+endif()

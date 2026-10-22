@@ -15,6 +15,10 @@
 #include "esp_cam_sensor_detect.h"
 #include "esp_sccb_i2c.h"
 #include "py/objtuple.h"
+#if MICROPY_CAMERA_OV9281
+#include "ov9281.h"
+#endif
+#include "monochrome.h"
 #include "esp_private/esp_cache_private.h"
 #include "esp_cache.h"
 #include "esp_heap_caps.h"
@@ -39,6 +43,9 @@ static const esp_cam_sensor_format_t *active_format;
 static bool csi_enabled, csi_started, isp_enabled;
 static uint16_t frame_width, frame_height;
 static bool h264_mode;
+static bool monochrome;
+static uint8_t *mono_encoder_input;
+static size_t encoder_input_size;
 static esp_h264_enc_handle_t h264_handle;
 static uint8_t *h264_output;
 static uint32_t h264_output_size;
@@ -60,7 +67,7 @@ static void camera_check(esp_err_t result)
     }
 }
 
-static void camera_sensor_open(void)
+static void camera_sensor_open(const char *sensor)
 {
     i2c_master_bus_config_t bus = {
         .clk_source = I2C_CLK_SRC_DEFAULT,
@@ -70,6 +77,30 @@ static void camera_sensor_open(void)
         .flags.enable_internal_pullup = true,
     };
     camera_check(i2c_new_master_bus(&bus, &sensor_handle.i2c_bus_handle));
+#if MICROPY_CAMERA_OV9281
+    if (strcmp(sensor, "OV9281") == 0) {
+        // SCCB addresses are 7-bit: SID-low, programmable, SID-high.
+        const uint8_t addresses[] = {0x60, 0x70, 0x10};
+        for (size_t i = 0; i < MP_ARRAY_SIZE(addresses); ++i) {
+            sccb_i2c_config_t io = {
+                .scl_speed_hz = 100000, .device_address = addresses[i],
+                .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+            };
+            camera_check(sccb_new_i2c_io(sensor_handle.i2c_bus_handle, &io,
+                                       &sensor_handle.sccb_handle));
+            esp_cam_sensor_config_t cfg = {
+                .sccb_handle = sensor_handle.sccb_handle,
+                .reset_pin = -1, .pwdn_pin = -1, .xclk_pin = -1,
+                .sensor_port = ESP_CAM_SENSOR_MIPI_CSI,
+            };
+            sensor_device = ov9281_detect(&cfg);
+            if (sensor_device) return;
+            camera_check(esp_sccb_del_i2c_io(sensor_handle.sccb_handle));
+            sensor_handle.sccb_handle = NULL;
+        }
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("OV9281 sensor not detected"));
+    }
+#endif
     for (esp_cam_sensor_detect_fn_t *p = &__esp_cam_sensor_detect_fn_array_start;
          p < &__esp_cam_sensor_detect_fn_array_end; ++p) {
         if (p->port != ESP_CAM_SENSOR_MIPI_CSI) {
@@ -89,7 +120,9 @@ static void camera_sensor_open(void)
         };
         sensor_device = p->detect(&cfg);
         if (sensor_device) {
-            return;
+            if (strcmp(sensor_device->name, sensor) == 0) return;
+            esp_cam_sensor_del_dev(sensor_device);
+            sensor_device = NULL;
         }
         camera_check(esp_sccb_del_i2c_io(sensor_handle.sccb_handle));
         sensor_handle.sccb_handle = NULL;
@@ -99,6 +132,11 @@ static void camera_sensor_open(void)
 
 static bool camera_supported_format(const esp_cam_sensor_format_t *fmt)
 {
+    if (monochrome) {
+        // This backport exposes only monochrome RAW8 modes. Never demosaic them.
+        return fmt->port == ESP_CAM_SENSOR_MIPI_CSI &&
+               fmt->format == ESP_CAM_SENSOR_PIXFORMAT_RAW8;
+    }
     return fmt->port == ESP_CAM_SENSOR_MIPI_CSI &&
         (fmt->format == ESP_CAM_SENSOR_PIXFORMAT_RAW8 ||
          fmt->format == ESP_CAM_SENSOR_PIXFORMAT_RAW10) &&
@@ -142,7 +180,7 @@ static bool camera_trans_finished(esp_cam_ctlr_handle_t handle,
 /* -------------- init -------------- */
 static mp_obj_t camera_init_inner(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args)
 {
-    enum { ARG_w, ARG_h, ARG_h264, ARG_fps, ARG_gop, ARG_bitrate };
+    enum { ARG_w, ARG_h, ARG_h264, ARG_fps, ARG_gop, ARG_bitrate, ARG_sensor };
     static const mp_arg_t allowed_args[] = {
         { MP_QSTR_w, MP_ARG_INT, {.u_int = CSI_MIPI_CSI_DISP_HRES} },
         { MP_QSTR_h, MP_ARG_INT, {.u_int = CSI_MIPI_CSI_DISP_VRES} },
@@ -150,12 +188,23 @@ static mp_obj_t camera_init_inner(size_t n_args, const mp_obj_t *pos_args, mp_ma
         { MP_QSTR_fps, MP_ARG_INT, {.u_int = 20} },
         { MP_QSTR_gop, MP_ARG_INT, {.u_int = 10} },
         { MP_QSTR_bitrate, MP_ARG_INT, {.u_int = 2000000} },
+        { MP_QSTR_sensor, MP_ARG_OBJ, {.u_obj = MP_OBJ_NEW_QSTR(MP_QSTR_OV5647)} },
     };
         /* H264 settings are target rates; the application paces capture. */
     mp_arg_val_t args[MP_ARRAY_SIZE(allowed_args)];
     mp_arg_parse_all(n_args, pos_args, kw_args,
                      MP_ARRAY_SIZE(allowed_args), allowed_args, args);
 
+    const char *sensor = mp_obj_str_get_str(args[ARG_sensor].u_obj);
+    monochrome = strcmp(sensor, "OV9281") == 0;
+    if (strcmp(sensor, "OV5647") != 0 && !monochrome) {
+        mp_raise_ValueError(MP_ERROR_TEXT("sensor must be OV5647 or OV9281"));
+    }
+#if !MICROPY_CAMERA_OV9281
+    if (monochrome) {
+        mp_raise_ValueError(MP_ERROR_TEXT("OV9281 driver not built"));
+    }
+#endif
     const mp_int_t w = args[ARG_w].u_int;
     const mp_int_t h = args[ARG_h].u_int;
 
@@ -184,7 +233,7 @@ static mp_obj_t camera_init_inner(size_t n_args, const mp_obj_t *pos_args, mp_ma
         mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("LDO acquire failed"));
     }
     mp_printf(&mp_plat_print, "LDO initialized\n");
-    camera_sensor_open();
+    camera_sensor_open(sensor);
     esp_cam_sensor_format_array_t formats = {0};
     camera_check(esp_cam_sensor_query_format(sensor_device, &formats));
     active_format = camera_find_format(&formats, w, h);
@@ -197,7 +246,8 @@ static mp_obj_t camera_init_inner(size_t n_args, const mp_obj_t *pos_args, mp_ma
     }
     frame_width = w;
     frame_height = h;
-    cam_buffer_size = h264_mode ? (size_t)w * h * 3 / 2 : (size_t)w * h * 2;
+    encoder_input_size = h264_mode ? (size_t)w * h * 3 / 2 : (size_t)w * h * 2;
+    cam_buffer_size = monochrome ? (size_t)w * h : encoder_input_size;
     /* 2. 帧缓冲 */
     size_t align = 0;
     // Cache invalidation must use the external-memory cache-line alignment.
@@ -213,6 +263,13 @@ static mp_obj_t camera_init_inner(size_t n_args, const mp_obj_t *pos_args, mp_ma
     	mp_printf(&mp_plat_print, "Camera buffer %d allocated: %p\n", i, cam_buffers[i]);
     }
     mp_printf(&mp_plat_print, "%d camera buffers allocated\n", NUM_CAM_BUFFERS);
+    if (monochrome) {
+        mono_encoder_input = heap_caps_aligned_calloc(align, 1, encoder_input_size,
+                                                      MALLOC_CAP_SPIRAM);
+        if (!mono_encoder_input) {
+            mp_raise_msg(&mp_type_MemoryError, MP_ERROR_TEXT("Monochrome buffer alloc failed"));
+        }
+    }
     /* 4. CSI 控制器 */
     esp_cam_ctlr_csi_config_t csi_cfg = {
         .ctlr_id                = 0,
@@ -221,7 +278,8 @@ static mp_obj_t camera_init_inner(size_t n_args, const mp_obj_t *pos_args, mp_ma
         .lane_bit_rate_mbps     = active_format->mipi_info.mipi_clk / 1000000,
         .input_data_color_type  = active_format->format == ESP_CAM_SENSOR_PIXFORMAT_RAW10
                                   ? CAM_CTLR_COLOR_RAW10 : CAM_CTLR_COLOR_RAW8,
-        .output_data_color_type = h264_mode ? CAM_CTLR_COLOR_YUV420 : CAM_CTLR_COLOR_RGB565,
+        .output_data_color_type = monochrome ? CAM_CTLR_COLOR_RAW8 :
+                                  (h264_mode ? CAM_CTLR_COLOR_YUV420 : CAM_CTLR_COLOR_RGB565),
         .data_lane_num          = active_format->mipi_info.lane_num,
         .byte_swap_en           = false,
         .queue_items            = 1,
@@ -249,15 +307,20 @@ static mp_obj_t camera_init_inner(size_t n_args, const mp_obj_t *pos_args, mp_ma
         .input_data_color_type  = active_format->format == ESP_CAM_SENSOR_PIXFORMAT_RAW10
                                   ? ISP_COLOR_RAW10 : ISP_COLOR_RAW8,
         .bayer_order            = COLOR_RAW_ELEMENT_ORDER_GBRG,
-        .output_data_color_type = h264_mode ? ISP_COLOR_YUV420 : ISP_COLOR_RGB565,
+        .output_data_color_type = monochrome ? ISP_COLOR_RAW8 :
+                                  (h264_mode ? ISP_COLOR_YUV420 : ISP_COLOR_RGB565),
+        .flags.bypass_isp = monochrome,
         .has_line_start_packet  = active_format->mipi_info.line_sync_en,
         .has_line_end_packet    = active_format->mipi_info.line_sync_en,
         .h_res                  = w,
         .v_res                  = h,
     };
     camera_check(esp_isp_new_processor(&isp_cfg, &isp_proc));
-    camera_check(esp_isp_enable(isp_proc));
-    isp_enabled = true;
+    // Bypass is configured by new_processor; IDF forbids enabling it.
+    if (!monochrome) {
+        camera_check(esp_isp_enable(isp_proc));
+        isp_enabled = true;
+    }
     mp_printf(&mp_plat_print, "ISP processor initialized\n");
     /* 6. 启动 */
     if (esp_cam_ctlr_start(cam_handle) != ESP_OK) {
@@ -276,7 +339,7 @@ static mp_obj_t camera_init_inner(size_t n_args, const mp_obj_t *pos_args, mp_ma
         };
         h264_check(esp_h264_enc_hw_new(&cfg, &h264_handle));
         h264_check(esp_h264_enc_open(h264_handle));
-        h264_output = esp_h264_aligned_calloc(64, 1, cam_buffer_size,
+        h264_output = esp_h264_aligned_calloc(64, 1, encoder_input_size,
                                             &h264_output_size, ESP_H264_MEM_SPIRAM);
         if (!h264_output) {
             mp_raise_msg(&mp_type_MemoryError, MP_ERROR_TEXT("H264 output allocation failed"));
@@ -369,6 +432,10 @@ static mp_obj_t camera_deinit(void)
     }
     h264_output_size = 0;
     h264_mode = false;
+    monochrome = false;
+    free(mono_encoder_input);
+    mono_encoder_input = NULL;
+    encoder_input_size = 0;
     if (jpeg_handle) {
         jpeg_del_encoder_engine(jpeg_handle);
         jpeg_handle = NULL;
@@ -439,9 +506,19 @@ static mp_obj_t camera_capture(void)
         mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("Camera cache invalidate failed"));
     }
 
+    uint8_t *encoder_input = cam_buffers[0];
+    if (monochrome) {
+        camera_mono_convert(cam_buffers[0], mono_encoder_input,
+                            (size_t)frame_width * frame_height, h264_mode);
+        encoder_input = mono_encoder_input;
+        if (h264_mode) {
+            camera_check(esp_cache_msync(encoder_input, encoder_input_size,
+                                        ESP_CACHE_MSYNC_FLAG_DIR_C2M));
+        }
+    }
     if (h264_mode) {
         esp_h264_enc_in_frame_t input = {
-            .raw_data = {.buffer = cam_buffers[0], .len = cam_buffer_size},
+            .raw_data = {.buffer = encoder_input, .len = encoder_input_size},
         };
         esp_h264_enc_out_frame_t output = {
             .raw_data = {.buffer = h264_output, .len = h264_output_size},
@@ -459,7 +536,7 @@ static mp_obj_t camera_capture(void)
         return mp_obj_new_tuple(2, result);
     }
     // 获取原始图像数据大小
-    raw_size_1080p = cam_buffer_size;
+    raw_size_1080p = encoder_input_size;
 
     // 分配内存用于存储原始图像数据
     size_t tx_buffer_size = 0;
@@ -469,7 +546,7 @@ static mp_obj_t camera_capture(void)
     }
 
     // 将相机缓冲区的内容复制到分配的内存中
-    memcpy(raw_buf_1080p, cam_buffers[0], raw_size_1080p);
+    memcpy(raw_buf_1080p, encoder_input, raw_size_1080p);
 
     // 分配内存用于存储 JPEG 数据
     size_t rx_buffer_size = 0;
